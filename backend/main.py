@@ -1,292 +1,189 @@
-import os
-import argparse
+"""
+main.py — Agentic RAG with Real-Time Tools
 
+Entry point for the 05-agentic-rag-realtime project.  Assembles the full
+pipeline: knowledge base indexing → tool registry → agent → interactive Q&A.
+
+Usage examples:
+    # Single query
+    python main.py --query "What is AAPL's current stock price?"
+
+    # Interactive multi-turn session
+    python main.py --interactive
+
+    # Use a specific knowledge base directory
+    python main.py --kb-dir /path/to/docs --interactive
+
+    # Disable conversation memory (stateless mode)
+    python main.py --interactive --no-memory
+
+    # Hide the agent's reasoning trace
+    python main.py --query "Weather in Tokyo" --no-verbose
+"""
+
+import os
+import sys
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from src.document_loader import load_documents
-from src.chunker import chunk_documents
-from src.embedder import get_embedding_model, embed_text
-from src.vector_store import get_or_create_vector_store
-from src.retriever import get_retriever, retrieve_chunks
-from src.generator import build_qa_chain
+# Load .env before importing project modules (they may read env vars at import time).
+load_dotenv()
 
 
-def parse_args():
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _check_api_keys(config: dict) -> None:
     """
-    Parse command-line arguments.
-
-    argparse is Python's built-in library for CLI argument handling.
-    It automatically generates --help text from the descriptions below.
+    Print a startup banner showing which tools are ready / missing API keys.
+    This helps users quickly see what's available before running queries.
     """
-    parser = argparse.ArgumentParser(
-        description="RAG from Scratch — Ask questions about your documents using AI.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py
-  python main.py --question "What are the main topics?"
-  python main.py --model ollama/llama3 --question "Summarize the documents"
-  python main.py --debug --question "What is the refund policy?"
-  python main.py --data-dir /path/to/docs --index-path /path/to/index
-        """,
-    )
+    google_key = config.get("google_api_key")
+    tavily_key = config.get("tavily_api_key")
+    owm_key = config.get("openweathermap_api_key")
 
-    parser.add_argument(
-        "--data-dir",
-        default="data/sample_docs",
-        help="Path to folder containing .pdf, .txt, or .docx files. "
-             "Default: data/sample_docs",
-    )
-
-    parser.add_argument(
-        "--index-path",
-        default="faiss_index",
-        help="Path to save/load the FAISS vector index. "
-             "Default: faiss_index (created automatically on first run).",
-    )
-
-    parser.add_argument(
-        "--model",
-        default="gpt-3.5-turbo",
-        help="LLM to use for answer generation. "
-             "Options: gpt-3.5-turbo, gpt-4, ollama/llama3, ollama/mistral. "
-             "Default: gpt-3.5-turbo",
-    )
-
-    parser.add_argument(
-        "--question",
-        default=None,
-        help="A single question to answer and exit. "
-             "If omitted, starts an interactive Q&A loop.",
-    )
-
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug mode: print the full prompt sent to LLM and "
-             "detailed chain steps.",
-    )
-
-    parser.add_argument(
-        "--k",
-        type=int,
-        default=3,
-        help="Number of chunks to retrieve per query (top-k). Default: 3.",
-    )
-
-    return parser.parse_args()
-
-
-def run_pipeline(args):
-    """
-    Execute the full RAG pipeline end-to-end.
-
-    This function orchestrates all 6 steps, printing clear separators between
-    each phase so you can follow along and understand what's happening.
-    """
-
-    print("=" * 60)
-    print("  RAG FROM SCRATCH — PIPELINE STARTING")
-    print("=" * 60)
-
-    # -------------------------------------------------------------------------
-    # LOAD ENVIRONMENT VARIABLES
-    # -------------------------------------------------------------------------
-    # .env is NOT committed to git (see .gitignore). Copy .env.example → .env
-    # and fill in your OPENAI_API_KEY before running with an OpenAI model.
-    load_dotenv()
-
-    # Warn early if using OpenAI but the API key is missing
-    if not args.model.startswith("ollama/") and not os.getenv("OPENAI_API_KEY"):
-        print(
-            "\n⚠️  WARNING: OPENAI_API_KEY is not set in your environment.\n"
-            "   Either:\n"
-            "     1. Copy .env.example to .env and add your API key, OR\n"
-            "     2. Use a local model with --model ollama/llama3\n"
-        )
-
-    # -------------------------------------------------------------------------
-    # STEP 1: LOAD DOCUMENTS
-    # -------------------------------------------------------------------------
-    print("\n" + "─" * 60)
-    print("STEP 1/6: Loading documents")
-    print("─" * 60)
-    print(f"  Source directory: {args.data_dir}")
-
-    documents = load_documents(args.data_dir)
-
-    # If no documents were found, we can't continue — tell the user what to do
-    if not documents:
-        print(
-            "\n❌ No documents loaded. Please add .pdf, .txt, or .docx files to:\n"
-            f"   {args.data_dir}\n"
-            "\nThen re-run: python main.py"
-        )
-        return
-
-    # -------------------------------------------------------------------------
-    # STEP 2: CHUNK DOCUMENTS
-    # -------------------------------------------------------------------------
-    print("\n" + "─" * 60)
-    print("STEP 2/6: Chunking documents")
-    print("─" * 60)
-
-    chunks = chunk_documents(
-        documents,
-        chunk_size=500,   # ~1-2 short paragraphs per chunk
-        chunk_overlap=50, # 50 chars of overlap to preserve context at boundaries
-    )
-
-    # -------------------------------------------------------------------------
-    # STEP 3: LOAD EMBEDDING MODEL
-    # -------------------------------------------------------------------------
-    print("\n" + "─" * 60)
-    print("STEP 3/6: Loading embedding model")
-    print("─" * 60)
-    print("  Model: all-MiniLM-L6-v2 (free, local, no API key needed)")
-
-    embedding_model = get_embedding_model("all-MiniLM-L6-v2")
-
-    # DEMO: Show what an embedding vector looks like (educational, not required)
-    if args.debug and chunks:
-        embed_text(chunks[0].page_content[:100], embedding_model)
-
-    # -------------------------------------------------------------------------
-    # STEP 4: BUILD OR LOAD VECTOR STORE
-    # -------------------------------------------------------------------------
-    print("\n" + "─" * 60)
-    print("STEP 4/6: Building / loading FAISS vector store")
-    print("─" * 60)
-    print(f"  Index location: {args.index_path}/")
-    print(f"  Tip: Delete '{args.index_path}/' to force a full rebuild.")
-
-    vector_store = get_or_create_vector_store(
-        chunks=chunks,
-        embedding_model=embedding_model,
-        path=args.index_path,
-    )
-
-    # -------------------------------------------------------------------------
-    # STEP 5: SET UP RETRIEVER
-    # -------------------------------------------------------------------------
-    print("\n" + "─" * 60)
-    print("STEP 5/6: Configuring retriever")
-    print("─" * 60)
-    print(f"  Retrieval strategy: cosine similarity, top-k={args.k}")
-
-    retriever = get_retriever(vector_store, k=args.k)
-
-    # -------------------------------------------------------------------------
-    # STEP 6: BUILD QA CHAIN (LLM + RETRIEVER)
-    # -------------------------------------------------------------------------
-    print("\n" + "─" * 60)
-    print("STEP 6/6: Building QA chain (LLM + Retriever)")
-    print("─" * 60)
-
-    qa_chain = build_qa_chain(
-        retriever=retriever,
-        model_name=args.model,
-        debug=args.debug,
-    )
+    rag_status    = "✅ RAG Tool ready"
+    finance_status = "✅ Finance Tool ready (yfinance — no key needed)"
+    wiki_status   = "✅ Wikipedia Tool ready (no key needed)"
+    web_status    = "✅ Web Search ready" if tavily_key else "❌ Web Search (no TAVILY_API_KEY)"
+    weather_status = "✅ Weather Tool ready" if owm_key else "⚠️  Weather Tool (mock mode — no OPENWEATHERMAP_API_KEY)"
+    gemini_status = "✅ Gemini connected" if google_key else "❌ Gemini (no GOOGLE_API_KEY — required)"
 
     print("\n" + "=" * 60)
-    print("  PIPELINE READY — Let's ask some questions!")
+    print("  Agentic RAG — Tool Availability")
+    print("=" * 60)
+    for status in [gemini_status, rag_status, finance_status, wiki_status, web_status, weather_status]:
+        print(f"  {status}")
     print("=" * 60)
 
-    # -------------------------------------------------------------------------
-    # Q&A PHASE: Single question or interactive loop
-    # -------------------------------------------------------------------------
-
-    if args.question:
-        # Single question mode — answer it and exit
-        ask_question(qa_chain, args.question, args.debug)
-    else:
-        # Interactive mode — keep asking until the user types 'quit' or 'exit'
-        print("\n💬 Interactive Q&A Mode")
-        print("   Type your question and press Enter.")
-        print("   Type 'quit' or 'exit' to stop.\n")
-
-        # Sample question to get the user started
-        sample_question = "What are the main topics covered in these documents?"
-        print(f"   💡 Sample question: {sample_question}\n")
-
-        while True:
-            try:
-                question = input("Your question: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                # Handle Ctrl+C gracefully
-                print("\n\nGoodbye! 👋")
-                break
-
-            if not question:
-                print("   (Please type a question, or 'quit' to exit)")
-                continue
-
-            if question.lower() in ("quit", "exit", "q"):
-                print("Goodbye! 👋")
-                break
-
-            ask_question(qa_chain, question, args.debug)
+    if not google_key:
+        print("\n[ERROR] GOOGLE_API_KEY is required. Add it to your .env file.")
+        sys.exit(1)
 
 
-def ask_question(qa_chain, question: str, debug: bool = False):
+def _print_example_queries() -> None:
+    """Print suggested example queries so new users know what to try."""
+    print("\nExample queries:")
+    print('  • "What is the current price of AAPL?"')
+    print('  • "What\'s the weather in London today?"')
+    print('  • "Search Wikipedia for transformer neural networks"')
+    print('  • "What does our internal strategy document say about AI adoption?"')
+    print('  • "What is AAPL price and how does it compare to our internal valuation?"')
+    print('  • "What are latest AI news stories relevant to our strategy?"')
+    print()
+
+
+def _build_config() -> dict:
+    """Read all configuration from environment variables and return as a dict."""
+    return {
+        "google_api_key":          os.getenv("GOOGLE_API_KEY", ""),
+        "gemini_model":            os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest"),
+        "tavily_api_key":          os.getenv("TAVILY_API_KEY", ""),
+        "openweathermap_api_key":  os.getenv("OPENWEATHERMAP_API_KEY", ""),
+        "domain_description":      "internal company documents and knowledge base",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Global Agent State
+# ---------------------------------------------------------------------------
+agent_executor = None
+
+
+class ChatRequest(BaseModel):
+    query: str
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
-    Ask a single question and print the answer with source attribution.
-
-    Args:
-        qa_chain:      The assembled RetrievalQA chain.
-        question (str): The question to ask.
-        debug (bool):   If True, print source document details.
+    Startup event: index docs, build tools, create the LLM agent.
     """
+    global agent_executor
+    config = _build_config()
+    _check_api_keys(config)
 
-    print(f"\n❓ Question: {question}")
-    print("   (Retrieving relevant chunks and generating answer...)\n")
+    kb_dir = os.getenv("KNOWLEDGE_BASE_DIR", "data/knowledge_base")
+    print(f"\n[Setup] Indexing knowledge base from '{kb_dir}' …")
+    from src.knowledge_indexer import index_knowledge_base  # noqa: PLC0415
+    vector_store = index_knowledge_base(
+        kb_dir=kb_dir,
+        index_path=os.path.join(kb_dir, ".faiss_index"),
+    )
 
+    print("[Setup] Building tool registry …")
+    from src.tool_registry import build_tool_registry, get_tool_descriptions  # noqa: PLC0415
+    tools = build_tool_registry(vector_store, config)
+    print(get_tool_descriptions(tools))
+
+    print(f"\n[Setup] Connecting to Gemini model '{config['gemini_model']}' …")
+    from langchain_google_genai import ChatGoogleGenerativeAI  # noqa: PLC0415
+    llm = ChatGoogleGenerativeAI(
+        model=config["gemini_model"],
+        google_api_key=config["google_api_key"],
+        temperature=0,  
+    )
+
+    print("[Setup] Creating agent …")
+    from src.agent import create_agent  # noqa: PLC0415
+    agent_executor = create_agent(tools, llm, memory=True, verbose=True)
+    
+    yield  # API serves traffic here
+
+    print("\n[Shutdown] Tearing down server.")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="Agentic RAG API",
+    description="Backend server for the RAG Agent",
+    lifespan=lifespan
+)
+
+# Enable CORS for the frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    """
+    Receive a query from the frontend and process it via the agent.
+    """
+    global agent_executor
+    if not agent_executor:
+        raise HTTPException(status_code=500, detail="Agent is not initialized.")
+    
+    from src.response_formatter import extract_tools_from_steps  # noqa: PLC0415
     try:
-        # .invoke() runs the full chain:
-        #   question → embed → FAISS search → retrieve chunks → fill prompt → LLM → answer
-        result = qa_chain.invoke({"query": question})
-
-        # The result dict has:
-        #   result["result"]            → the LLM's answer string
-        #   result["source_documents"]  → list of Document objects used as context
-        answer = result["result"]
-        source_docs = result.get("source_documents", [])
-
-        print(f"💡 Answer:\n{answer}")
-
-        # Show which source documents contributed to this answer
-        if source_docs:
-            print("\n📚 Sources used:")
-            seen_sources = set()
-            for doc in source_docs:
-                source = doc.metadata.get("source", "unknown")
-                page = doc.metadata.get("page", "")
-                page_info = f", page {page}" if page != "" else ""
-                source_key = f"{source}{page_info}"
-
-                # Deduplicate — a source file may appear multiple times (different chunks)
-                if source_key not in seen_sources:
-                    print(f"   • {source_key}")
-                    seen_sources.add(source_key)
-
-                    # In debug mode, show the actual chunk text used
-                    if debug:
-                        print(f"     Context: {doc.page_content[:150]}...")
-
-    except Exception as e:
-        print(f"\n❌ Error generating answer: {e}")
-        print(
-            "\nCommon causes:\n"
-            "  • Missing OPENAI_API_KEY (check your .env file)\n"
-            "  • Ollama not running (start with: ollama serve)\n"
-            "  • Model not pulled (run: ollama pull llama3)\n"
-            "  • Network connectivity issues\n"
-        )
-
-    print()  # blank line for readability between questions
+        # Note: In production you might use invoke() asynchronously if supported
+        result = agent_executor.invoke({"input": request.query})
+        answer = result.get("output", str(result))
+        steps = result.get("intermediate_steps", [])
+        tools_used = extract_tools_from_steps(steps)
+        
+        return {
+            "answer": answer,
+            "tools_used": tools_used
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run_pipeline(args)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+# (CLI code removed in favor of FastAPI)
