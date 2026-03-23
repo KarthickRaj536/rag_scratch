@@ -24,8 +24,9 @@ Usage examples:
 import os
 import sys
 from contextlib import asynccontextmanager
+from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -93,6 +94,7 @@ def _build_config() -> dict:
 # Global Agent State
 # ---------------------------------------------------------------------------
 agent_executor = None
+vector_store_global = None
 
 
 class ChatRequest(BaseModel):
@@ -104,21 +106,24 @@ async def lifespan(app: FastAPI):
     """
     Startup event: index docs, build tools, create the LLM agent.
     """
-    global agent_executor
+    global agent_executor, vector_store_global
     config = _build_config()
     _check_api_keys(config)
 
     kb_dir = os.getenv("KNOWLEDGE_BASE_DIR", "data/knowledge_base")
+    # Ensure dir exists so users can upload files
+    os.makedirs(kb_dir, exist_ok=True)
+    
     print(f"\n[Setup] Indexing knowledge base from '{kb_dir}' …")
     from src.knowledge_indexer import index_knowledge_base  # noqa: PLC0415
-    vector_store = index_knowledge_base(
+    vector_store_global = index_knowledge_base(
         kb_dir=kb_dir,
         index_path=os.path.join(kb_dir, ".faiss_index"),
     )
 
     print("[Setup] Building tool registry …")
     from src.tool_registry import build_tool_registry, get_tool_descriptions  # noqa: PLC0415
-    tools = build_tool_registry(vector_store, config)
+    tools = build_tool_registry(vector_store_global, config)
     print(get_tool_descriptions(tools))
 
     print(f"\n[Setup] Connecting to Gemini model '{config['gemini_model']}' …")
@@ -180,6 +185,47 @@ async def chat_endpoint(request: ChatRequest):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/upload")
+async def upload_files(files: List[UploadFile] = File(...)):
+    """
+    Endpoint stringently receiving knowledge base files up to 15MB total.
+    """
+    global vector_store_global
+    
+    kb_dir = os.getenv("KNOWLEDGE_BASE_DIR", "data/knowledge_base")
+    os.makedirs(kb_dir, exist_ok=True)
+    
+    MAX_SIZE = 15 * 1024 * 1024 # 15 MB
+    total_size = 0
+    saved_paths = []
+
+    for file in files:
+        content = await file.read()
+        total_size += len(content)
+        
+        if total_size > MAX_SIZE:
+            # Revert any saved files logic if sizes exceed
+            for p in saved_paths:
+                if os.path.exists(p):
+                    os.remove(p)
+            raise HTTPException(status_code=400, detail="Total file size exceeds 15MB limit.")
+        
+        file_path = os.path.join(kb_dir, file.filename)
+        with open(file_path, "wb") as f:
+            f.write(content)
+        saved_paths.append(file_path)
+
+    if vector_store_global and saved_paths:
+        from src.knowledge_indexer import add_files_to_index
+        index_path = os.path.join(kb_dir, ".faiss_index")
+        add_files_to_index(saved_paths, vector_store_global, index_path)
+
+    return {
+        "message": "Files uploaded and knowledge base updated successfully", 
+        "files": [os.path.basename(p) for p in saved_paths]
+    }
 
 
 if __name__ == "__main__":

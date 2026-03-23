@@ -134,6 +134,45 @@ def load_index(index_path: str) -> FAISS:
     return vector_store
 
 
+def add_files_to_index(file_paths: List[str], vector_store: FAISS, index_path: str):
+    """
+    Process newly uploaded files and add them to the existing index.
+    """
+    documents = []
+    
+    for fp in file_paths:
+        ext = fp.lower()
+        try:
+            if ext.endswith('.pdf'):
+                loader = PyPDFLoader(fp)
+            elif ext.endswith('.txt'):
+                loader = TextLoader(fp, encoding="utf-8")
+            else:
+                print(f"[Indexer] Unsupported file type for {fp}")
+                continue
+                
+            docs = loader.load()
+            documents.extend(docs)
+            print(f"[Indexer] Loaded newly uploaded file {fp}")
+        except Exception as exc:
+            print(f"[Indexer] Failed to load {fp}: {exc}")
+
+    if not documents:
+        return
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+    )
+    chunks = splitter.split_documents(documents)
+    print(f"[Indexer] Splitted into {len(chunks)} chunks")
+
+    vector_store.add_documents(chunks)
+    
+    vector_store.save_local(index_path)
+    print(f"[Indexer] Updated FAISS index saved to '{index_path}'")
+
+
 def search_knowledge_base(
     query: str,
     vector_store: FAISS,
